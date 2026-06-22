@@ -1,11 +1,11 @@
 ; RUN: %llvm_mc -mcpu=gfx1250 %s -o %t.o && %ld_lld -shared %t.o -o %t.hsaco \
 ; RUN:   && %raise_cli %t.hsaco --target-isa=gfx1250 \
-; RUN:     --emit-ir=v_cvt_scalef32_pk8_fp8_f32_kernel 2>/dev/null \
+; RUN:     --emit-ir=v_cvt_scalef32_pk8_fp8_f32_kernel \
 ; RUN:   | %FileCheck %s --check-prefix=NATIVE
 ;
 ; RUN: %llvm_mc -mcpu=gfx1250 %s -o %t.o && %ld_lld -shared %t.o -o %t.hsaco \
 ; RUN:   && %raise_cli %t.hsaco --target-isa=gfx942 \
-; RUN:     --emit-ir=v_cvt_scalef32_pk8_fp8_f32_kernel 2>/dev/null \
+; RUN:     --emit-ir=v_cvt_scalef32_pk8_fp8_f32_kernel \
 ; RUN:   | %FileCheck %s --check-prefix=CROSS
 ;
 ; Lift test for v_cvt_scalef32_pk8_fp8_f32 (gfx1250-only VOP3,
@@ -55,6 +55,11 @@
 ; CROSS-DAG: %pk_fp8_23 = call i32 @llvm.amdgcn.cvt.pk.fp8.f32(float %{{.+}}, float %{{.+}}, i32 %pk_fp8_01, i1 true)
 ; CROSS-DAG: %pk_fp8_45 = call i32 @llvm.amdgcn.cvt.pk.fp8.f32(float %{{.+}}, float %{{.+}}, i32 0, i1 false)
 ; CROSS-DAG: %pk_fp8_67 = call i32 @llvm.amdgcn.cvt.pk.fp8.f32(float %{{.+}}, float %{{.+}}, i32 %pk_fp8_45, i1 true)
+
+; gfx942's pk_fp8 produces FNUZ bytes; re-encode FNUZ->OCP so the result VGPR
+; stays in the gfx1250 source (OCP) fp8 format. Per-byte vectorized re-encode
+; ends in a <4 x i32> -> <4 x i8> trunc.
+; CROSS-DAG: trunc <4 x i32> %{{[^ ]+}} to <4 x i8>
 
 ; Negative: no native gfx1250 intrinsic on the cross-target path
 ; (would mean the dispatch silently mis-fired).
