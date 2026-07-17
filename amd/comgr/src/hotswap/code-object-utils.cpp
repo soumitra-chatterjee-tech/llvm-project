@@ -277,6 +277,8 @@ llvm::Expected<KernelMeta> extractKernelMeta(llvm::MemoryBufferRef ElfData,
         if (llvm::msgpack::DocNode *N =
                 findInMap(KMap, ".private_segment_fixed_size"))
           Meta.PrivateSegmentFixedSize = nodeAsInt(*N);
+        if (llvm::msgpack::DocNode *N = findInMap(KMap, ".vgpr_count"))
+          Meta.VgprCount = nodeAsInt(*N);
         if (llvm::msgpack::DocNode *N =
                 findInMap(KMap, ".max_flat_workgroup_size"))
           Meta.MaxFlatWorkgroupSize = nodeAsInt(*N);

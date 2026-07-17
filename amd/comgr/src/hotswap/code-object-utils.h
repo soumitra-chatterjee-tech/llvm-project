@@ -72,6 +72,10 @@ struct KernelMeta {
   uint32_t KernargSegmentSize = 0;
   uint32_t GroupSegmentFixedSize = 0;
   uint32_t PrivateSegmentFixedSize = 0;
+  // Architected VGPRs the kernel occupies (`.vgpr_count`). Zero when the note
+  // omits it (e.g. a source object that predates the field); the post-codegen
+  // budget check treats zero as "unknown" and only gates on the target object.
+  uint32_t VgprCount = 0;
   uint32_t MaxFlatWorkgroupSize = 256;
   // Code object v6 `.cluster_dims`: [0,0,0] means clusters are disabled.
   // Any non-zero value carries source cluster state that HotSwap does not
