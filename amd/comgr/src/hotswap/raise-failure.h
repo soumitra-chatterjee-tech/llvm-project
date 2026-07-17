@@ -122,6 +122,14 @@ enum class RaiseFailureReason : uint16_t {
   // cluster dimensions. TTMP6 then carries real per-cluster workgroup state
   // that the current HotSwap ABI model does not reconstruct.
   UnsupportedSourceClusterDims,
+  // Post-codegen budget gate: the target object the backend emitted requests
+  // more architected VGPRs or per-lane scratch than the target ISA can launch.
+  // wave32->wave64 widening plus the alloca-per-register reg file can push a
+  // spill-heavy kernel past the ceiling; the runtime would then reject the
+  // dispatch with HSA_STATUS_ERROR_OUT_OF_RESOURCES. Refusing here turns that
+  // opaque runtime failure into an actionable transpile-time refusal. `detail`
+  // names the budget exceeded and both the requested and limit values.
+  TargetResourceBudgetExceeded,
 };
 
 // Human-readable name for a `RaiseFailureReason`. Stable enough for
@@ -306,6 +314,12 @@ struct RaiseFailure : public llvm::ErrorInfo<RaiseFailure> {
 
   // Phase 4 init: source cluster dimensions are explicit and non-disabled.
   static llvm::Error unsupportedSourceClusterDims(llvm::StringRef KernelName,
+                                                  const llvm::Twine &Detail);
+
+  // Post-codegen budget gate: the target object exceeds a launchable resource
+  // budget for the target ISA. `kernelName` attributes the refusal; `detail`
+  // names the budget exceeded and both the requested and limit values.
+  static llvm::Error targetResourceBudgetExceeded(llvm::StringRef KernelName,
                                                   const llvm::Twine &Detail);
 };
 

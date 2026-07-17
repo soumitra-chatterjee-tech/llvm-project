@@ -76,6 +76,8 @@ const char *reasonString(RaiseFailureReason R) {
     return "user-sgpr-layout-mismatch";
   case RaiseFailureReason::UnsupportedSourceClusterDims:
     return "unsupported-source-cluster-dims";
+  case RaiseFailureReason::TargetResourceBudgetExceeded:
+    return "target-resource-budget-exceeded";
   }
   llvm_unreachable("unhandled RaiseFailureReason");
 }
@@ -273,6 +275,14 @@ RaiseFailure::unsupportedSourceClusterDims(llvm::StringRef KernelName,
                                            const llvm::Twine &Detail) {
   return makeKernelScopedFailure(
       RaiseFailureReason::UnsupportedSourceClusterDims, "<source-cluster-dims>",
+      KernelName, Detail);
+}
+
+llvm::Error
+RaiseFailure::targetResourceBudgetExceeded(llvm::StringRef KernelName,
+                                           const llvm::Twine &Detail) {
+  return makeKernelScopedFailure(
+      RaiseFailureReason::TargetResourceBudgetExceeded, "<resource-budget>",
       KernelName, Detail);
 }
 

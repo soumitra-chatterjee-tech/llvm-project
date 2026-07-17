@@ -33,6 +33,12 @@
 #include "llvm/Transforms/Utils/Cloning.h"
 #include "llvm/Transforms/Utils/LowerSwitch.h"
 
+// AMDGPU target-private headers (target VGPR / scratch ceilings for the budget
+// gate). Exposed to the hotswap build via the source-tree include dirs in
+// CMakeLists.txt, not the installed LLVM headers.
+#include "GCNSubtarget.h"
+#include "Utils/AMDGPUBaseInfo.h"
+
 #include <algorithm>
 #include <chrono>
 #include <cstdio>
@@ -224,6 +230,70 @@ llvm::Error emitCodeGen(llvm::Module &M, llvm::TargetMachine &TM,
                                    "target cannot emit requested file type");
 
   PM.run(M);
+  return llvm::Error::success();
+}
+
+// Optional tightening override for a resource budget, read from `EnvVar`. When
+// unset or unparseable the ISA-derived `Ceiling` stands; when set it can only
+// lower the budget (std::min), never raise it above what the hardware can
+// launch. Lets operators tighten the budget and lets tests exercise the
+// refusal against an ordinary kernel without a pathological spiller.
+uint64_t tightenedBudget(const char *EnvVar, uint64_t Ceiling) {
+  std::optional<std::string> Env = llvm::sys::Process::GetEnv(EnvVar);
+  uint64_t Override = 0;
+  if (Env && !llvm::StringRef(*Env).getAsInteger(10, Override))
+    return std::min(Ceiling, Override);
+  return Ceiling;
+}
+
+// Refuse a kernel whose freshly emitted target object requests more resources
+// than the target ISA can launch. wave32->wave64 widening and the alloca-per-
+// register reg file can push a spill-heavy kernel past the architectural VGPR
+// ceiling, which the backend then covers with hundreds of KB of per-lane
+// scratch; the runtime rejects that dispatch with
+// HSA_STATUS_ERROR_OUT_OF_RESOURCES. Turning it into a transpile-time refusal
+// keeps the failure actionable instead of surfacing as an opaque dispatch
+// error later. Both budgets are read from the target subtarget so the check
+// scales with the ISA rather than hardcoding gfx942/gfx950 numbers.
+//
+// Returns a refusal Error when over budget, success otherwise (including when
+// the object carries no readable metadata, which the surrounding pipeline
+// already treats as a non-fatal best-effort case).
+llvm::Error checkTargetResourceBudget(llvm::StringRef KernelName,
+                                      llvm::MemoryBufferRef ObjData,
+                                      const llvm::GCNSubtarget &ST) {
+  llvm::Expected<KernelMeta> MetaOrErr = extractKernelMeta(ObjData, KernelName);
+  if (!MetaOrErr) {
+    llvm::consumeError(MetaOrErr.takeError());
+    return llvm::Error::success();
+  }
+  const KernelMeta &Meta = *MetaOrErr;
+
+  // Architected VGPR ceiling for the target ISA (256 on gfx942/gfx950, 1024 on
+  // gfx1250 wave32). A kernel occupying more than this can never be allocated.
+  const uint64_t MaxVGPRs = tightenedBudget(
+      "HSA_HOTSWAP_MAX_TARGET_VGPR",
+      llvm::AMDGPU::IsaInfo::getAddressableNumArchVGPRs(&ST));
+  if (Meta.VgprCount > MaxVGPRs)
+    return RaiseFailure::targetResourceBudgetExceeded(
+        KernelName, "target VGPR " + llvm::Twine(Meta.VgprCount) + " exceeds " +
+                        ST.getCPU() + " max " + llvm::Twine(MaxVGPRs));
+
+  // Per-lane scratch ceiling: the backend's own maximum addressable private
+  // segment per work-item (COMPUTE_TMPRING_SIZE.WAVESIZE decoded for this
+  // generation and wavefront size -- the same limit the AsmPrinter validates
+  // against). It is the largest scratch a wave can be launched with, sits far
+  // above every launchable kernel observed (<= a few KB/lane), and rejects the
+  // pathological spill footprints wave-widening produces.
+  const uint64_t MaxScratchPerLane =
+      tightenedBudget("HSA_HOTSWAP_MAX_TARGET_SCRATCH",
+                      ST.getMaxWaveScratchSize() / ST.getWavefrontSize());
+  if (Meta.PrivateSegmentFixedSize > MaxScratchPerLane)
+    return RaiseFailure::targetResourceBudgetExceeded(
+        KernelName,
+        "per-lane scratch " + llvm::Twine(Meta.PrivateSegmentFixedSize) +
+            " B exceeds " + ST.getCPU() + " launchable budget " +
+            llvm::Twine(MaxScratchPerLane) + " B");
   return llvm::Error::success();
 }
 
@@ -506,6 +576,22 @@ static bool raiseAndCompileKernel(
   }
   Result.Timings.optSeconds += timingElapsed(Options.CollectTimings, OptStart);
 
+  // Capture the target subtarget before codegen consumes the module: the
+  // post-codegen budget check reads the target ISA's VGPR / scratch ceilings
+  // from it. Fall back to any defined function so the check still runs when the
+  // emitted symbol name differs from the source kernel name.
+  const llvm::Function *KernelFn = M.getFunction(KernelName);
+  if (!KernelFn)
+    for (const llvm::Function &F : M)
+      if (!F.isDeclaration()) {
+        KernelFn = &F;
+        break;
+      }
+  const auto *ST =
+      KernelFn ? static_cast<const llvm::GCNSubtarget *>(
+                     TM->getSubtargetImpl(*KernelFn))
+               : nullptr;
+
   // Object codegen consumes the module, so clone it first when a debug
   // assembly dump is still needed.
   std::unique_ptr<llvm::Module> AsmModule;
@@ -523,6 +609,26 @@ static bool raiseAndCompileKernel(
     llvm::errs() << "transpiler: llc failed for '" << KernelName
                  << "': " << llvm::toString(std::move(Err)) << "\n";
     return false;
+  }
+
+  // Refuse-don't-miscompile: reject a target object the runtime cannot launch
+  // (over the VGPR / scratch budget) instead of emitting it to fail at dispatch
+  // with HSA_STATUS_ERROR_OUT_OF_RESOURCES.
+  if (ST) {
+    llvm::MemoryBufferRef ObjRef(
+        llvm::StringRef(ObjBytes.data(), ObjBytes.size()), ObjPath);
+    if (llvm::Error BudgetErr =
+            checkTargetResourceBudget(KernelName, ObjRef, *ST)) {
+      Result.FailKernel = KernelName;
+      Result.FailMnemonic = "<resource-budget>";
+      Result.FailReason =
+          reasonString(RaiseFailureReason::TargetResourceBudgetExceeded);
+      Result.FailFormat =
+          reasonString(RaiseFailureReason::TargetResourceBudgetExceeded);
+      Result.FailDetail = llvm::toString(std::move(BudgetErr));
+      llvm::errs() << "transpiler: " << Result.FailDetail << "\n";
+      return false;
+    }
   }
 
   if (llvm::Error WriteErr = writeFile(
