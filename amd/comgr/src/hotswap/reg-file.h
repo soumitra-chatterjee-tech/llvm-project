@@ -78,6 +78,13 @@ struct AllocaRegFile {
   // ISA is wave32; on wave64 sources EXEC_HI is a real half of the EXEC mask
   // and routes through Exec.
   llvm::AllocaInst *ExecHiScratch = nullptr;
+  // VCC scalar-pair shadow: the raw i64 value when VCC is used as a B64
+  // register pair (pointer arithmetic, SMEM base address). Written by
+  // writeReg64(VCC, V); invalidated by storeVCC() (wave-mask writes). Read by
+  // readReg64(VCC) / readOp64 / SMEM base-address reads via
+  // loadVCCRawOrWaveMask.
+  llvm::AllocaInst *VccRaw = nullptr;
+  llvm::AllocaInst *VccRawValid = nullptr; // i1 -- true when VccRaw is current
   llvm::AllocaInst *Scc = nullptr;
   llvm::AllocaInst *Exec = nullptr;
   llvm::AllocaInst *M0 = nullptr;
@@ -178,6 +185,15 @@ struct AllocaRegFile {
   // `wave-projection.h` for the outer-EXEC-only invariant this
   // relies on.
   llvm::Value *readVCCAsWaveMask(llvm::IRBuilder<> &B, llvm::Type *ResultTy);
+
+  // Record a raw i64 scalar value written to VCC as a B64 register pair
+  // (e.g. s_lshl_b64 vcc, ...) and mark the shadow current.
+  void storeVCCRaw(llvm::IRBuilder<> &B, llvm::Value *V);
+  // Mark VccRaw as stale (called when VCC is overwritten as a wave mask).
+  void invalidateVCCRaw(llvm::IRBuilder<> &B);
+  // Read VCC as a raw i64 scalar pair if the shadow is valid, else fall back
+  // to the wave-mask ballot at the requested width.
+  llvm::Value *loadVCCRawOrWaveMask(llvm::IRBuilder<> &B, llvm::Type *ResultTy);
 
   // Generic read/write by ParsedReg.
   llvm::Value *readReg32(llvm::IRBuilder<> &B, ParsedReg Pr);

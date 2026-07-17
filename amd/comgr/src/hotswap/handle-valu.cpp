@@ -1816,21 +1816,30 @@ Expected<HandlerResult> handleVALU(RaiseContext &Ctx, const DecodedInst &Di,
       ScaleNumerator = true; // (n, d, n)
     } else if (Src0EqSrc1 && !Src0EqSrc2) {
       ScaleNumerator = false; // (d, d, n)
+    } else if (Src0EqSrc1 && Src0EqSrc2) {
+      // (x, x, x) -- all three operands identical: the degenerate x/x
+      // shape emitted by Triton's layer-norm / group-norm reciprocal-
+      // stddev path (e.g. DiT-XL-2-256's
+      // triton_red_fused_add_convolution_native_layer_norm_transpose_view_4).
+      // When numer == denom the ratio is 1.0 regardless of which operand
+      // the scale flag selects, so the flag convention is irrelevant for
+      // the downstream div_fixup result.  Canonicalise to scale-numerator
+      // to keep the LLVM intrinsic call well-formed.
+      ScaleNumerator = true;
     } else {
-      // All three sources matching is the degenerate `x/x` shape
-      // (ambiguous between scale-numer and scale-denom); src2 not
-      // matching either of src0/src1 would break the hardware's own
-      // divide-protocol and is unreachable from any known codegen
-      // emitter.  Refuse loudly rather than guess -- consistent with
-      // the "refuse when uncertain" rule in
+      // src2 does not match either src0 or src1 -- this breaks the
+      // hardware's own divide-protocol and is unreachable from any known
+      // codegen emitter.  Refuse loudly rather than guess -- consistent
+      // with the "refuse when uncertain" rule in
       // hotswap/docs/wave-size-translation.md.
       return RaiseFailure::unsupportedInstructionForm(
           Di, "VOP3",
           "v_div_scale_f32 operand triple does not match a known "
           "divide-scaling shape: expected (numer, denom, numer) with "
-          "src0 == src2 for scale-numerator, or (denom, denom, numer) "
-          "with src0 == src1 for scale-denominator.  See handle-valu.cpp "
-          "for the decode rule.");
+          "src0 == src2 for scale-numerator, (denom, denom, numer) "
+          "with src0 == src1 for scale-denominator, or (x, x, x) for "
+          "the degenerate x/x case.  See handle-valu.cpp for the "
+          "decode rule.");
     }
 
     // FP-modifier symmetry check on the matched-identity pair.  The
@@ -1997,13 +2006,18 @@ Expected<HandlerResult> handleVALU(RaiseContext &Ctx, const DecodedInst &Di,
       ScaleNumerator = true;
     } else if (Src0EqSrc1 && !Src0EqSrc2) {
       ScaleNumerator = false;
+    } else if (Src0EqSrc1 && Src0EqSrc2) {
+      // (x, x, x) -- degenerate x/x shape; see the V_DIV_SCALE_F32 handler
+      // above for the full rationale.  Canonicalise to scale-numerator.
+      ScaleNumerator = true;
     } else {
       return RaiseFailure::unsupportedInstructionForm(
           Di, "VOP3",
           "v_div_scale_f64 operand triple does not match a known "
           "divide-scaling shape: expected (numer, denom, numer) with "
-          "src0 == src2 for scale-numerator, or (denom, denom, numer) "
-          "with src0 == src1 for scale-denominator.");
+          "src0 == src2 for scale-numerator, (denom, denom, numer) "
+          "with src0 == src1 for scale-denominator, or (x, x, x) for "
+          "the degenerate x/x case.");
     }
     unsigned Peer = ScaleNumerator ? 2u : 1u;
     if (Op.srcMod(0) != Op.srcMod(Peer)) {

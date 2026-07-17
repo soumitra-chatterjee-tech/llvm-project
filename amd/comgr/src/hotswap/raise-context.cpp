@@ -501,7 +501,9 @@ Value *RaiseContext::readOp64(const DecodedInst &Di, unsigned OpIdx) {
   if (Di.isReg(OpIdx)) {
     ParsedReg Pr = parseReg(Di.getReg(OpIdx), OpIdx);
     if (Pr.RegKind == ParsedReg::VCC)
-      return Regs.readVCCAsWaveMask(B, I64Ty);
+      // VCC read as a B64 value: prefer the raw scalar-pair shadow (pointer
+      // arithmetic) and fall back to the wave-mask ballot; see readReg64.
+      return Regs.loadVCCRawOrWaveMask(B, I64Ty);
     if (Pr.RegKind == ParsedReg::EXEC) {
       Value *V = Regs.loadExec(B);
       if (V->getType() != I64Ty)

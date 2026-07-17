@@ -391,7 +391,12 @@ Expected<HandlerResult> handleSMEM(RaiseContext &Ctx, const DecodedInst &Di,
     // Generic GEP+load against `addrspace(1)`. AMDGPU ISel selects the final
     // memory path from the pointer value's uniformity and provenance.
     {
-      Value *BaseAddr = Ctx.Regs.loadSGPR64(Ctx.B, Base.BaseIdx);
+      // GFX1250 Triton kernels occasionally use VCC as a scalar pair for
+      // pointer arithmetic (e.g. `s_lshl_b64 vcc, ...; s_load_b32 sN, vcc, 0`).
+      // Route the base address through readReg64, which handles SGPR, VCC, and
+      // EXEC uniformly, instead of the SGPR-only loadSGPR64 (which aborts with
+      // idx=-1 for a VCC base).
+      Value *BaseAddr = Ctx.Regs.readReg64(Ctx.B, Base);
       Value *Ptr = Ctx.B.CreateIntToPtr(BaseAddr, Ctx.PtrGlobalTy);
       if (ImmOffset) {
         if (ByteOffset != 0)
@@ -588,7 +593,10 @@ Expected<HandlerResult> handleSMEM(RaiseContext &Ctx, const DecodedInst &Di,
         Ctx.getKernargPtrProvenance();
     bool BaseIsKnownNonEntry = BaseProvenance.isNonEntry();
     bool BaseIsLiveEntry = BaseProvenance.isLiveEntry();
-    Value *BaseAddr = Ctx.Regs.loadSGPR64(Ctx.B, Base.BaseIdx);
+    // readReg64 handles SGPR, VCC (scalar-pair shadow), and EXEC uniformly;
+    // kernarg-provenance above is computed from Base directly, not from the
+    // materialised address, so a VCC base still lowers correctly here.
+    Value *BaseAddr = Ctx.Regs.readReg64(Ctx.B, Base);
     Value *Ptr = Ctx.B.CreateIntToPtr(BaseAddr, Ctx.PtrGlobalTy);
     unsigned OffIdx = Op.srcIdx(1);
     if (Di.isImm(OffIdx)) {
@@ -835,7 +843,8 @@ Expected<HandlerResult> handleSMEM(RaiseContext &Ctx, const DecodedInst &Di,
     Data = Ctx.Regs.readReg32(Ctx.B, DataDst);
   }
 
-  Value *BaseAddr = Ctx.Regs.loadSGPR64(Ctx.B, Base.BaseIdx);
+  // readReg64 handles SGPR, VCC (scalar-pair shadow), and EXEC uniformly.
+  Value *BaseAddr = Ctx.Regs.readReg64(Ctx.B, Base);
   Value *Ptr = Ctx.B.CreateIntToPtr(BaseAddr, Ctx.PtrGlobalTy);
 
   // Positional source index of the offset operand in OpResolver's
