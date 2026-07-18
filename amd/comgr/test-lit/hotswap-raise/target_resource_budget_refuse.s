@@ -3,6 +3,10 @@
 ; dispatch with HSA_STATUS_ERROR_OUT_OF_RESOURCES. The budget is tightened via
 ; env so an ordinary kernel trips it deterministically; unset, the same kernel
 ; transpiles.
+; The default VGPR budget is the launchable ceiling (512 on gfx942/gfx950); a
+; 257-512 VGPR kernel launches and is not refused. Reaching that range needs a
+; real spill-heavy kernel, so it is checked on hardware; this small kernel only
+; exercises the env-tightened refusal and the default-budget pass.
 
 ; RUN: %llvm_mc -mcpu=gfx1250 %s -o %t.o && %ld_lld -shared %t.o -o %t.hsaco \
 ; RUN:   && env HSA_HOTSWAP_MAX_TARGET_VGPR=1 %not %raise_cli %t.hsaco \
