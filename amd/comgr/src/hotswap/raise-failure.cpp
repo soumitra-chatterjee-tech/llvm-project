@@ -78,6 +78,8 @@ const char *reasonString(RaiseFailureReason R) {
     return "unsupported-source-cluster-dims";
   case RaiseFailureReason::TargetResourceBudgetExceeded:
     return "target-resource-budget-exceeded";
+  case RaiseFailureReason::CodegenUnsafeWWMPressure:
+    return "codegen-unsafe-wwm-pressure";
   }
   llvm_unreachable("unhandled RaiseFailureReason");
 }
@@ -284,6 +286,13 @@ RaiseFailure::targetResourceBudgetExceeded(llvm::StringRef KernelName,
   return makeKernelScopedFailure(
       RaiseFailureReason::TargetResourceBudgetExceeded, "<resource-budget>",
       KernelName, Detail);
+}
+
+llvm::Error
+RaiseFailure::codegenUnsafeWWMPressure(llvm::StringRef KernelName,
+                                       const llvm::Twine &Detail) {
+  return makeKernelScopedFailure(RaiseFailureReason::CodegenUnsafeWWMPressure,
+                                 "<codegen-wwm>", KernelName, Detail);
 }
 
 llvm::Error

@@ -130,6 +130,16 @@ enum class RaiseFailureReason : uint16_t {
   // opaque runtime failure into an actionable transpile-time refusal. `detail`
   // names the budget exceeded and both the requested and limit values.
   TargetResourceBudgetExceeded,
+  // Pre-codegen safety gate: the raised kernel contains more whole-wave-mode
+  // (WWM) regions -- forced by convergent cross-lane ops such as
+  // llvm.amdgcn.ds.swizzle / strict.wwm / set.inactive -- than the AMDGPU
+  // backend can lower. On such a kernel SIPreAllocateWWMRegs faults in
+  // MachineRegisterInfo::isPhysRegUsed (llvm-project#272, backend-owned), which
+  // would crash the whole transpile process (SIGSEGV, no object) rather than
+  // emit a launchable kernel. Refusing here before codegen turns that fatal
+  // backend crash into a clean, actionable transpile-time refusal so the
+  // runtime can fall back. `detail` names the WWM-region count and the budget.
+  CodegenUnsafeWWMPressure,
 };
 
 // Human-readable name for a `RaiseFailureReason`. Stable enough for
@@ -321,6 +331,12 @@ struct RaiseFailure : public llvm::ErrorInfo<RaiseFailure> {
   // names the budget exceeded and both the requested and limit values.
   static llvm::Error targetResourceBudgetExceeded(llvm::StringRef KernelName,
                                                   const llvm::Twine &Detail);
+
+  // Pre-codegen safety gate: the raised kernel has too many WWM regions for the
+  // AMDGPU backend to lower (SIPreAllocateWWMRegs crash, llvm-project#272).
+  // `kernelName` attributes the refusal; `detail` names the count and budget.
+  static llvm::Error codegenUnsafeWWMPressure(llvm::StringRef KernelName,
+                                              const llvm::Twine &Detail);
 };
 
 } // namespace COMGR::hotswap
