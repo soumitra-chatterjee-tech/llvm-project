@@ -269,11 +269,14 @@ llvm::Error checkTargetResourceBudget(llvm::StringRef KernelName,
   }
   const KernelMeta &Meta = *MetaOrErr;
 
-  // Architected VGPR ceiling for the target ISA (256 on gfx942/gfx950, 1024 on
-  // gfx1250 wave32). A kernel occupying more than this can never be allocated.
-  const uint64_t MaxVGPRs = tightenedBudget(
-      "HSA_HOTSWAP_MAX_TARGET_VGPR",
-      llvm::AMDGPU::IsaInfo::getAddressableNumArchVGPRs(&ST));
+  // Launchable VGPR ceiling for the target ISA: 512 on gfx90a-family
+  // (gfx942/gfx950), whose unified VGPR+AGPR file lets an AGPR-free kernel
+  // address all 512 as VGPRs; 1024 on gfx1250 wave32. This is the launchable
+  // count, not getAddressableNumArchVGPRs (arch VGPRs only). Static budget, so
+  // DynamicVGPRBlockSize is 0.
+  const uint64_t MaxVGPRs =
+      tightenedBudget("HSA_HOTSWAP_MAX_TARGET_VGPR",
+                      llvm::AMDGPU::IsaInfo::getAddressableNumVGPRs(&ST, 0));
   if (Meta.VgprCount > MaxVGPRs)
     return RaiseFailure::targetResourceBudgetExceeded(
         KernelName, "target VGPR " + llvm::Twine(Meta.VgprCount) + " exceeds " +
