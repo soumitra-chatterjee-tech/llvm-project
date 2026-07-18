@@ -12,6 +12,8 @@
 #include "llvm/Analysis/CGSCCPassManager.h"
 #include "llvm/Analysis/LoopAnalysisManager.h"
 #include "llvm/IR/Instructions.h"
+#include "llvm/IR/IntrinsicInst.h"
+#include "llvm/IR/IntrinsicsAMDGPU.h"
 #include "llvm/IR/LLVMContext.h"
 #include "llvm/IR/LegacyPassManager.h"
 #include "llvm/IR/Module.h"
@@ -297,6 +299,66 @@ llvm::Error checkTargetResourceBudget(llvm::StringRef KernelName,
         "per-lane scratch " + llvm::Twine(Meta.PrivateSegmentFixedSize) +
             " B exceeds " + ST.getCPU() + " launchable budget " +
             llvm::Twine(MaxScratchPerLane) + " B");
+  return llvm::Error::success();
+}
+
+// Default whole-wave-mode (WWM) region budget for the pre-codegen safety gate.
+// A convergent cross-lane op (ds_swizzle / ds_bpermute-style shuffles routed
+// through strict.wwm, set.inactive, softwqm, or an explicit wwm/strict.wwm
+// bracket) forces the backend to reserve a WWM register region. Beyond a few
+// hundred such regions in one function, SIPreAllocateWWMRegs faults in
+// MachineRegisterInfo::isPhysRegUsed (llvm-project#272), taking the whole
+// transpile process down with a SIGSEGV instead of emitting an object. The
+// budget sits well above every WWM count observed on a launchable transpiled
+// kernel (a butterfly reduction needs only a handful of stages) and below the
+// pathological counts (Wan `_10`: 480 ds_swizzle) that crash the backend.
+constexpr uint64_t DefaultMaxWWMRegions = 256;
+
+// Refuse a raised kernel the AMDGPU backend cannot lower without crashing.
+// This runs BEFORE codegen precisely because the failure mode is a backend
+// SIGSEGV (llvm-project#272, SIPreAllocateWWMRegs) during code emission: once
+// emitCodeGen is entered there is no object to inspect and no error to return
+// -- the process dies. So the post-codegen resource-budget gate above cannot
+// catch it. We instead detect the crash precondition -- an excessive number of
+// WWM-forcing convergent cross-lane ops -- in the IR and refuse cleanly, so the
+// runtime falls back to a native kernel rather than the whole transpile
+// aborting. Backend-owned bug; this is a HotSwap-side safe-ship, not a fix.
+llvm::Error checkCodegenSafety(llvm::StringRef KernelName,
+                               const llvm::Module &M) {
+  const uint64_t MaxWWMRegions =
+      tightenedBudget("HSA_HOTSWAP_MAX_WWM_REGIONS", DefaultMaxWWMRegions);
+
+  uint64_t WWMRegions = 0;
+  for (const llvm::Function &F : M) {
+    for (const llvm::BasicBlock &BB : F) {
+      for (const llvm::Instruction &I : BB) {
+        const auto *II = llvm::dyn_cast<llvm::IntrinsicInst>(&I);
+        if (!II)
+          continue;
+        switch (II->getIntrinsicID()) {
+        case llvm::Intrinsic::amdgcn_ds_swizzle:
+        case llvm::Intrinsic::amdgcn_ds_bpermute:
+        case llvm::Intrinsic::amdgcn_ds_permute:
+        case llvm::Intrinsic::amdgcn_wwm:
+        case llvm::Intrinsic::amdgcn_strict_wwm:
+        case llvm::Intrinsic::amdgcn_set_inactive:
+        case llvm::Intrinsic::amdgcn_softwqm:
+          ++WWMRegions;
+          break;
+        default:
+          break;
+        }
+      }
+    }
+  }
+
+  if (WWMRegions > MaxWWMRegions)
+    return RaiseFailure::codegenUnsafeWWMPressure(
+        KernelName, "WWM-region count " + llvm::Twine(WWMRegions) +
+                        " exceeds codegen-safe budget " +
+                        llvm::Twine(MaxWWMRegions) +
+                        " (SIPreAllocateWWMRegs / llvm-project#272 would crash "
+                        "the backend); refusing so the runtime can fall back");
   return llvm::Error::success();
 }
 
@@ -593,6 +655,23 @@ static bool raiseAndCompileKernel(
       KernelFn ? static_cast<const llvm::GCNSubtarget *>(
                      TM->getSubtargetImpl(*KernelFn))
                : nullptr;
+
+  // Pre-codegen safety gate: refuse a kernel whose WWM-region pressure would
+  // crash the AMDGPU backend (SIPreAllocateWWMRegs, llvm-project#272) rather
+  // than let emitCodeGen SIGSEGV the whole process. Must run before codegen: a
+  // crash inside emitCodeGen leaves no object and no error to inspect, so the
+  // post-codegen resource-budget gate below cannot catch it.
+  if (llvm::Error SafetyErr = checkCodegenSafety(KernelName, M)) {
+    Result.FailKernel = KernelName;
+    Result.FailMnemonic = "<codegen-wwm>";
+    Result.FailReason =
+        reasonString(RaiseFailureReason::CodegenUnsafeWWMPressure);
+    Result.FailFormat =
+        reasonString(RaiseFailureReason::CodegenUnsafeWWMPressure);
+    Result.FailDetail = llvm::toString(std::move(SafetyErr));
+    llvm::errs() << "transpiler: " << Result.FailDetail << "\n";
+    return false;
+  }
 
   // Object codegen consumes the module, so clone it first when a debug
   // assembly dump is still needed.
