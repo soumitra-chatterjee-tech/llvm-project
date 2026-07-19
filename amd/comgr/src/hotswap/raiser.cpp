@@ -577,6 +577,115 @@ computeKernargProvenanceSuccessors(const DecodedInst &LastInst,
   return Result;
 }
 
+// rocm-systems#159: mark VGPR defs whose value is gathered by a convergent
+// cross-lane primitive.
+//
+// Under WaveNativeProjection (wave32 -> wave64), a VGPR store is normally
+// routed through `emitUnderExec`, so at a *partial-EXEC* swap site a source-
+// inactive butterfly partner keeps a STALE reg-file value. The convergent
+// `ds_swizzle`/`ds_bpermute`/`ds_permute` then gathers that stale value
+// (instead of the source's data-neutralised `-inf`/`0` identity) into an
+// active lane's reduction -> wrong row-max/-sum -> silent miscompile
+// (empty gemma softmax output). See wave-size-translation.md sec. 10 gap
+// P4.b and `DecodedInst::DstFeedsCrossLane`.
+//
+// The value a def produces is already whole-wave-correct (the source masks
+// its data before the swap), so committing it under whole-wave EXEC restores
+// the source's "EXEC=full at the swap site" invariant for the convergent
+// read. This prepass sets `DstFeedsCrossLane` on a def IFF its written VGPR
+// is READ by a convergent cross-lane primitive as the *very next use* along
+// a straight-line (single-block) window, before the VGPR is redefined, EXEC
+// changes, or a block boundary intervenes. The window is deliberately narrow
+// to keep the whole-wave commit tightly scoped: broadening it risks over-
+// marking a value that must stay per-lane-masked (a NEW silent miscompile),
+// which the refuse-don't-miscompile invariant forbids.
+//
+// Only runs under WaveNativeProjection (`numSourceWavesPerTarget() > 1`);
+// single-source-wave projections have EXEC == full at every source
+// instruction, so their VGPR stores are already whole-wave and no marking is
+// needed (nor would it change anything).
+static void markCrossLaneConsumedDefs(MutableArrayRef<DecodedInst> Insts,
+                                      const MCState &Mc,
+                                      const WaveProjection &Projection) {
+  if (Projection.numSourceWavesPerTarget() <= 1)
+    return;
+
+  const MCRegisterInfo &MRI = *Mc.RegInfo;
+
+  // Return the base VGPR encoding index (REG_IDX) of a physical reg if it is
+  // (or its sub0 lane is) a VGPR, else -1.
+  auto vgprBaseIdx = [&](MCRegister Reg) -> int {
+    if (!Reg)
+      return -1;
+    MCRegister Lane = MRI.getSubReg(Reg, AMDGPU::sub0);
+    if (!Lane)
+      Lane = Reg;
+    Lane = AMDGPU::mc2PseudoReg(Lane);
+    unsigned Enc = MRI.getEncodingValue(Lane);
+    if (!(Enc & AMDGPU::HWEncoding::IS_VGPR))
+      return -1;
+    return static_cast<int>(Enc & AMDGPU::HWEncoding::REG_IDX_MASK);
+  };
+
+  // Is this a convergent cross-lane primitive whose data input is a VGPR read
+  // that must observe the whole-wave value?
+  auto isConvergentCrossLane = [](const DecodedInst &Di) {
+    return Di.CanonOp == CanonicalOp::DS_SWIZZLE_B32 ||
+           Di.CanonOp == CanonicalOp::DS_BPERMUTE_B32 ||
+           Di.CanonOp == CanonicalOp::DS_PERMUTE_B32;
+  };
+
+  const unsigned N = Insts.size();
+  for (unsigned I = 0; I < N; ++I) {
+    DecodedInst &Def = Insts[I];
+    // Consider only single-def VGPR-writing instructions (the reduction
+    // accumulator update). Multi-def / EXEC-writing / branch instructions are
+    // not the straight-line accumulator producer we target.
+    if (Def.NumDefs != 1 || Def.DefsExec || Def.DefsVcc || Def.IsBranch)
+      continue;
+    if (!Def.isReg(0))
+      continue;
+    int DefIdx = vgprBaseIdx(Def.getReg(0));
+    if (DefIdx < 0)
+      continue;
+
+    // Scan forward within the straight-line window for the next use/redef of
+    // this VGPR. Stop at block boundaries, EXEC changes, or branches.
+    for (unsigned J = I + 1; J < N; ++J) {
+      DecodedInst &Nxt = Insts[J];
+      if (Nxt.DefsExec || Nxt.IsBranch || decodedInstEndsBlock(Nxt))
+        break;
+
+      // Does Nxt READ this VGPR as a source operand?
+      bool ReadsDef = false;
+      for (unsigned K = 0; K < Nxt.NumSrcs; ++K) {
+        unsigned OpIdx = Nxt.SrcMap[K];
+        if (!Nxt.isReg(OpIdx))
+          continue;
+        if (vgprBaseIdx(Nxt.getReg(OpIdx)) == DefIdx) {
+          ReadsDef = true;
+          break;
+        }
+      }
+      if (ReadsDef) {
+        if (isConvergentCrossLane(Nxt))
+          Def.DstFeedsCrossLane = true;
+        // First reader reached (cross-lane or not): the def's next use is
+        // decided; stop. (Only a *direct* convergent next-use qualifies --
+        // an intervening non-cross-lane read means the value is consumed
+        // per-lane first and must not be whole-wave-committed.)
+        break;
+      }
+
+      // Redefinition before any read -> this def never reaches a cross-lane
+      // read; stop.
+      if (Nxt.NumDefs >= 1 && Nxt.isReg(0) &&
+          vgprBaseIdx(Nxt.getReg(0)) == DefIdx)
+        break;
+    }
+  }
+}
+
 // Fill RaiseContext's per-BB kernarg provenance map by fixed-point over the
 // recovered source CFG.
 static Error computeKernargPtrProvenance(
@@ -1147,6 +1256,12 @@ raiseToIRImpl(llvm::ArrayRef<uint8_t> TextBytes, llvm::StringRef SourceIsa,
   // decision surface. See wave-projection.cpp for the text of the
   // legacy diagnostic.
   emitCrossWaveWarning(Projection, Mc, Insts, SourceIsa, CompilationTargetIsa);
+
+  // rocm-systems#159: under wave-native cross-widening, mark VGPR defs whose
+  // value is gathered by a convergent cross-lane butterfly so their store is
+  // committed whole-wave (see markCrossLaneConsumedDefs). No-op for single-
+  // source-wave projections.
+  markCrossLaneConsumedDefs(Insts, Mc, Projection);
 
   // ==== Phase 1.4.5: Wave-size obstruction classifier
   // (hotswap/docs/wave-size-translation.md sec. 7) ====
@@ -1955,6 +2070,11 @@ raiseToIRImpl(llvm::ArrayRef<uint8_t> TextBytes, llvm::StringRef SourceIsa,
     // RaiseContext::resetLaneActiveCache in raise-context.h for the full
     // invalidation contract.
     Ctx.resetLaneActiveCache();
+    // rocm-systems#159: propagate the prepass mark for "this def is
+    // gathered by a convergent cross-lane primitive" into the context so
+    // writeReg32/writeReg64 commit the VGPR whole-wave. Reset every
+    // instruction so the default per-lane gating is restored.
+    Ctx.CurDstFeedsCrossLane = Di.DstFeedsCrossLane;
     OpResolver Op{Ctx, Di};
 
     // Dispatch to the format-specific handler by querying TSFlags (and

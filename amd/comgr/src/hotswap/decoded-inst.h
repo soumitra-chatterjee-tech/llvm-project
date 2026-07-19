@@ -145,6 +145,36 @@ struct DecodedInst {
   bool HasDsSwizzleImm = false;
   uint16_t DsSwizzleImm = 0;
 
+  // -- Cross-lane consumed-def marking (rocm-systems#159 fix; see
+  //    hotswap/docs/wave-size-translation.md sec. 10 gap P4.b) --
+  //
+  // Set by the raiser's `markCrossLaneConsumedDefs` prepass when this
+  // instruction's destination VGPR is read by a *convergent cross-lane*
+  // primitive (`ds_swizzle_b32` / `ds_bpermute_b32` / `ds_permute_b32`)
+  // as the very next use, before the VGPR is redefined / EXEC changes /
+  // a basic-block boundary intervenes -- i.e. this def is the value that
+  // will be gathered across lanes by a butterfly reduction.
+  //
+  // Under `WaveNativeProjection` (wave32 -> wave64), a normal VGPR store
+  // is routed through `emitUnderExec`, so at a *partial-EXEC* swap site a
+  // source-inactive partner lane keeps a STALE reg-file value instead of
+  // the source's data-neutralised (`-inf`/`0`) reduction identity. The
+  // convergent read then gathers that stale value -> wrong row-max/-sum
+  // -> silent miscompile (empty gemma softmax output, rocm-systems#159).
+  //
+  // The def value itself is already computed WHOLE-WAVE in straight-line
+  // code (the source applies its own `select(mask, real, identity)` data
+  // masking before the swap), so committing it under whole-wave EXEC (not
+  // the partial source EXEC) restores the source invariant "EXEC=full at
+  // the swap site" for the convergent read WITHOUT injecting any
+  // per-lane side effect (VGPR stores are not memory side effects; a
+  // later redefinition re-establishes the per-lane value under its own
+  // gate). See `RaiseContext::writeReg32`/`writeReg64`. The prepass is
+  // deliberately conservative (single linear next-use, WaveNative only)
+  // to keep this narrow -- broadening it risks over-marking a value that
+  // must stay per-lane-masked (a NEW silent miscompile).
+  bool DstFeedsCrossLane = false;
+
   // -- VOPD structural decode ----------------------------------------
   //
   // VOPD packets contain two VALU component instructions sharing one

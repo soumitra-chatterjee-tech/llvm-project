@@ -659,7 +659,17 @@ Value *RaiseContext::emitLaneActiveBit() {
 }
 
 void RaiseContext::writeReg32(ParsedReg Pr, Value *V) {
-  if (Pr.RegKind == ParsedReg::VGPR || Pr.RegKind == ParsedReg::AGPR) {
+  if (Pr.RegKind == ParsedReg::VGPR && CurDstFeedsCrossLane) {
+    // rocm-systems#159: this VGPR def is consumed by a convergent
+    // cross-lane primitive (butterfly reduction) as its next use. The
+    // computed value is already whole-wave-correct (the source applied
+    // its own data masking before the swap), so commit it under
+    // whole-wave EXEC -- NOT the partial source EXEC diamond -- to keep
+    // partner-lane convergent reads from gathering a stale value at a
+    // partial-EXEC swap site. Safe: a VGPR store is not a memory side
+    // effect, and any later redefinition re-gates the per-lane value.
+    Regs.writeReg32(B, Pr, V);
+  } else if (Pr.RegKind == ParsedReg::VGPR || Pr.RegKind == ParsedReg::AGPR) {
     emitUnderExec([&] { Regs.writeReg32(B, Pr, V); });
   } else {
     Regs.writeReg32(B, Pr, V);
@@ -673,7 +683,10 @@ void RaiseContext::writeReg32(ParsedReg Pr, Value *V) {
 }
 
 void RaiseContext::writeReg64(ParsedReg Pr, Value *V) {
-  if (Pr.RegKind == ParsedReg::VGPR || Pr.RegKind == ParsedReg::AGPR) {
+  if (Pr.RegKind == ParsedReg::VGPR && CurDstFeedsCrossLane) {
+    // rocm-systems#159 whole-wave commit -- see writeReg32 above.
+    Regs.writeReg64(B, Pr, V);
+  } else if (Pr.RegKind == ParsedReg::VGPR || Pr.RegKind == ParsedReg::AGPR) {
     emitUnderExec([&] { Regs.writeReg64(B, Pr, V); });
   } else {
     Regs.writeReg64(B, Pr, V);

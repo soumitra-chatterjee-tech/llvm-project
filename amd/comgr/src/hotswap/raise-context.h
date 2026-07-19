@@ -172,6 +172,20 @@ struct RaiseContext {
   uint8_t VgprMsBs = 0;
   bool AssumeHipGlobalOffsetZero = false;
 
+  // rocm-systems#159: when the currently-dispatched instruction's
+  // destination VGPR is consumed by a convergent cross-lane primitive
+  // (marked `DecodedInst::DstFeedsCrossLane` by the raiser prepass), its
+  // VGPR store must be committed WHOLE-WAVE (unconditionally) rather than
+  // through the per-lane `emitUnderExec` diamond, so a partner lane's
+  // convergent read never gathers a stale/EXEC-gated value at a
+  // partial-EXEC swap site. Set from `Di.DstFeedsCrossLane` in the
+  // raiser dispatch loop before the handler runs; `writeReg32`/
+  // `writeReg64` read it. Reset to false every instruction (default
+  // per-lane gating). Only ever true under WaveNativeProjection (the
+  // prepass guards on `numSourceWavesPerTarget() > 1`). See the field doc
+  // on `DecodedInst::DstFeedsCrossLane` for the correctness argument.
+  bool CurDstFeedsCrossLane = false;
+
   // Per-instruction VGPR index adjustment, indexed by MCInst operand index.
   // Computed from vgprMSBs before each instruction dispatch. computeVGPRAdjust
   // returns an error if LLVM TableGen grows a VGPR-MSB-controlled operand
