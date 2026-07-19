@@ -274,6 +274,80 @@ struct RaiseContext {
   void storeVGPR64(int Idx, llvm::Value *V);
   void storeAGPR32(int Idx, llvm::Value *V);
 
+  // ==== rocm-systems#159: whole-wave VGPR shadow for convergent
+  // cross-lane reads (handler-scoped read-side fix; see
+  // hotswap/docs/wave-size-translation.md sec. 10 gap P4.b) ============
+  //
+  // Under `WaveNativeProjection` (wave32 -> wave64), a VGPR store is
+  // routed through the per-lane `emitUnderExec` diamond, so at a
+  // *partial-EXEC* swap site a source-inactive butterfly partner keeps a
+  // STALE reg-file value. A convergent cross-lane primitive
+  // (`ds_swizzle`/`ds_bpermute`/`ds_permute`) reads all 64 hardware
+  // lanes, so it gathers that stale value (instead of the source's
+  // data-neutralised `-inf`/`0` reduction identity) into an active lane's
+  // reduction -> wrong row-max/-sum -> silent miscompile (empty gemma
+  // softmax output, rocm-systems#159).
+  //
+  // The value each VGPR def produces is already computed WHOLE-WAVE in
+  // straight-line code (the source applies its own `select(mask, real,
+  // identity)` data masking before the swap), and only its *store* is
+  // EXEC-gated. So alongside every EXEC-gated VGPR store, `writeReg32`/
+  // `writeReg64` also record the value UNCONDITIONALLY into a per-index
+  // whole-wave shadow. A convergent cross-lane primitive then reads its
+  // data input through `readRegWholeWave`, which returns the shadow value
+  // (the whole-wave value present on ALL lanes, active and inactive)
+  // rather than the EXEC-gated reg-file phi.
+  //
+  // This is the narrow, read-side fix (Path A): the committed VGPR store
+  // is UNCHANGED (every non-cross-lane reader still sees the per-lane
+  // EXEC-gated value), so no def is re-routed and there is no
+  // over-marking degree of freedom -- only the convergent primitive's own
+  // input read observes the whole-wave value. Contrast the whole-wave-
+  // *store* variant (rocm-systems#159 fix (b)), which mutates the commit
+  // and was held NO-SHIP (turned #158 silent-empty into a hard fault).
+  //
+  // The shadow only dominates within its basic block (like the M0 and
+  // SGPR-wave-mask shadows), so it carries a per-index validity bit and
+  // is dropped at every BB boundary via `clearVgprWholeWaveShadow`. It is
+  // allocated only under a projection with the full-wave-EXEC invariant
+  // (`providesFullWaveExecInvariant()`); on any other projection the
+  // bank is empty and `readRegWholeWave` transparently falls back to the
+  // ordinary EXEC-gated read (no behaviour change).
+  llvm::SmallVector<llvm::AllocaInst *> VgprWholeWaveShadow;
+  llvm::SmallVector<llvm::AllocaInst *> VgprWholeWaveValidShadow;
+
+  // Allocate the whole-wave VGPR shadow banks (one i32 + one i1 per VGPR
+  // index) in the entry block. No-op unless the projection provides the
+  // full-wave-EXEC invariant. Called once by the raiser after the reg
+  // file is initialised.
+  void initVgprWholeWaveShadow(unsigned NumVgpr);
+
+  // Record `V` as the whole-wave (pre-EXEC-gate) value of VGPR `Idx` and
+  // mark it valid. Called from `writeReg32`/`writeReg64` for VGPR
+  // destinations, in the whole-wave (pre-diamond) insertion block. No-op
+  // when the shadow bank is empty.
+  void recordVgprWholeWave(int Idx, llvm::Value *V);
+
+  // Read VGPR `Pr` as its whole-wave value: the shadow value when a
+  // dominating whole-wave store recorded it in this BB, else the ordinary
+  // (EXEC-gated) reg-file value. Used by convergent cross-lane handlers
+  // for their data input so a source-inactive partner lane contributes
+  // the correct straight-line value rather than a stale one.
+  llvm::Value *readRegWholeWave(ParsedReg Pr);
+
+  // Drop every whole-wave-shadow validity bit. Called at every BB
+  // boundary in the raiser main loop, so a shadow value that no longer
+  // dominates the consumer is never read. Idempotent.
+  void clearVgprWholeWaveShadow();
+
+  // Append the whole-wave-shadow allocas for PromoteMemToReg.
+  void collectVgprWholeWaveShadowAllocas(
+      llvm::SmallVectorImpl<llvm::AllocaInst *> &Out) const {
+    Out.append(VgprWholeWaveShadow.begin(), VgprWholeWaveShadow.end());
+    Out.append(VgprWholeWaveValidShadow.begin(),
+               VgprWholeWaveValidShadow.end());
+  }
+
   // Provenance fact for the physical SGPR pair that originally held the
   // source-ABI kernarg-segment pointer.
   //

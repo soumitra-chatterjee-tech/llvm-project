@@ -878,7 +878,14 @@ Expected<HandlerResult> handleDS(RaiseContext &Ctx, const DecodedInst &Di,
     Value *Index = Op.src(0);
     if (Ctx.Isa.isWave32() && !Ctx.TargetIsa.isWave32())
       Index = rebaseSourceWaveLaneSelector(Ctx, Index, "bperm");
-    Value *Src = Op.src(1);
+    // rocm-systems#159: gather the data input WHOLE-WAVE (see the
+    // ds_swizzle handler below) so a source-inactive partner lane
+    // contributes its correct straight-line value, not a stale EXEC-gated
+    // one, at a partial-EXEC swap site. No-op off WaveNative.
+    ParsedReg BpermSrcReg = Op.srcReg(1);
+    Value *Src = (BpermSrcReg.RegKind == ParsedReg::VGPR)
+                     ? Ctx.readRegWholeWave(BpermSrcReg)
+                     : Op.src(1);
     Function *Bperm = Intrinsic::getOrInsertDeclaration(
         &Ctx.M, Intrinsic::amdgcn_ds_bpermute);
     Value *Gathered = Ctx.B.CreateCall(Bperm, {Index, Src}, "bperm");
@@ -907,7 +914,12 @@ Expected<HandlerResult> handleDS(RaiseContext &Ctx, const DecodedInst &Di,
     Value *Index = Op.src(0);
     if (Ctx.Isa.isWave32() && !Ctx.TargetIsa.isWave32())
       Index = rebaseSourceWaveLaneSelector(Ctx, Index, "perm");
-    Value *Src = Op.src(1);
+    // rocm-systems#159: gather the scattered data input WHOLE-WAVE (see the
+    // ds_swizzle handler below). No-op off WaveNative.
+    ParsedReg PermSrcReg = Op.srcReg(1);
+    Value *Src = (PermSrcReg.RegKind == ParsedReg::VGPR)
+                     ? Ctx.readRegWholeWave(PermSrcReg)
+                     : Op.src(1);
     Function *Perm =
         Intrinsic::getOrInsertDeclaration(&Ctx.M, Intrinsic::amdgcn_ds_permute);
     Value *Scattered = Ctx.B.CreateCall(Perm, {Index, Src}, "perm");
@@ -1069,7 +1081,24 @@ Expected<HandlerResult> handleDS(RaiseContext &Ctx, const DecodedInst &Di,
           "ds_swizzle_b32 missing OpName::addr VGPR operand -- operand "
           "table mismatch");
     }
-    Value *Src = Ctx.readOp32(Di, static_cast<unsigned>(AddrIdx));
+    // rocm-systems#159: ds_swizzle is a convergent cross-lane butterfly. On
+    // a wave32->wave64 WaveNative lift the swizzle runs on all 64 hardware
+    // lanes and gathers each partner lane's data VGPR. That VGPR's store is
+    // EXEC-gated (per-lane commit), so at a partial-EXEC swap site a
+    // source-inactive partner would contribute a STALE value. Read the data
+    // input WHOLE-WAVE so the partner contributes the correct straight-line
+    // value (the source's own data-masked `-inf`/`0` reduction identity),
+    // matching the source's "EXEC=full at the swap site" invariant. This is
+    // the read-side fix: the committed store is unchanged; only the
+    // swizzle's own input observes the whole-wave value. Falls back to the
+    // ordinary read on non-WaveNative projections and when no dominating
+    // in-BB whole-wave store exists.
+    ParsedReg SrcReg =
+        Ctx.parseReg(Di.getReg(static_cast<unsigned>(AddrIdx)),
+                     static_cast<int>(AddrIdx));
+    Value *Src = (SrcReg.RegKind == ParsedReg::VGPR)
+                     ? Ctx.readRegWholeWave(SrcReg)
+                     : Ctx.readOp32(Di, static_cast<unsigned>(AddrIdx));
     Function *Swiz =
         Intrinsic::getOrInsertDeclaration(&Ctx.M, Intrinsic::amdgcn_ds_swizzle);
     Value *Result = Ctx.B.CreateCall(

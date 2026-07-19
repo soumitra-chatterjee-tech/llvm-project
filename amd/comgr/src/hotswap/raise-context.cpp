@@ -660,6 +660,13 @@ Value *RaiseContext::emitLaneActiveBit() {
 
 void RaiseContext::writeReg32(ParsedReg Pr, Value *V) {
   if (Pr.RegKind == ParsedReg::VGPR || Pr.RegKind == ParsedReg::AGPR) {
+    // rocm-systems#159: record the whole-wave (pre-EXEC-gate) value BEFORE
+    // the per-lane diamond, so a convergent cross-lane reader can observe
+    // it via readRegWholeWave even on source-inactive lanes. VGPR only --
+    // cross-lane primitives read VGPRs, and the shadow is indexed by VGPR
+    // number. No-op unless a whole-wave shadow bank was allocated.
+    if (Pr.RegKind == ParsedReg::VGPR)
+      recordVgprWholeWave(Pr.BaseIdx, V);
     emitUnderExec([&] { Regs.writeReg32(B, Pr, V); });
   } else {
     Regs.writeReg32(B, Pr, V);
@@ -674,6 +681,20 @@ void RaiseContext::writeReg32(ParsedReg Pr, Value *V) {
 
 void RaiseContext::writeReg64(ParsedReg Pr, Value *V) {
   if (Pr.RegKind == ParsedReg::VGPR || Pr.RegKind == ParsedReg::AGPR) {
+    // rocm-systems#159: record the whole-wave value of both dwords of the
+    // pair (indexed per 32-bit VGPR) before the per-lane diamond. See
+    // writeReg32. No-op unless a whole-wave shadow bank was allocated.
+    if (Pr.RegKind == ParsedReg::VGPR && !VgprWholeWaveShadow.empty()) {
+      Value *V64 = V;
+      if (V64->getType()->isPointerTy())
+        V64 = B.CreatePtrToInt(V64, I64Ty);
+      if (V64->getType() != I64Ty)
+        V64 = B.CreateBitCast(V64, I64Ty);
+      Value *Lo = B.CreateTrunc(V64, I32Ty, "ww_pair_lo");
+      Value *Hi = B.CreateTrunc(B.CreateLShr(V64, 32), I32Ty, "ww_pair_hi");
+      recordVgprWholeWave(Pr.BaseIdx, Lo);
+      recordVgprWholeWave(Pr.BaseIdx + 1, Hi);
+    }
     emitUnderExec([&] { Regs.writeReg64(B, Pr, V); });
   } else {
     Regs.writeReg64(B, Pr, V);
@@ -684,6 +705,20 @@ void RaiseContext::writeReg64(ParsedReg Pr, Value *V) {
 
 void RaiseContext::writeRegVec(ParsedReg Pr, Value *V) {
   if (Pr.RegKind == ParsedReg::VGPR || Pr.RegKind == ParsedReg::AGPR) {
+    // rocm-systems#159: record the whole-wave value of each written dword
+    // before the per-lane diamond. Mirrors AllocaRegFile::writeRegVec's
+    // dword decomposition. No-op unless a whole-wave shadow bank exists.
+    if (Pr.RegKind == ParsedReg::VGPR && !VgprWholeWaveShadow.empty()) {
+      unsigned TotalBits = V->getType()->getPrimitiveSizeInBits();
+      unsigned TotalDwords = (TotalBits + 31) / 32;
+      Type *IntTy = Type::getIntNTy(C, TotalDwords * 32);
+      Value *Packed = B.CreateBitCast(V, IntTy);
+      for (unsigned I = 0; I < TotalDwords; ++I) {
+        Value *Dw = I == 0 ? B.CreateTrunc(Packed, I32Ty)
+                           : B.CreateTrunc(B.CreateLShr(Packed, I * 32), I32Ty);
+        recordVgprWholeWave(Pr.BaseIdx + I, Dw);
+      }
+    }
     emitUnderExec([&] { Regs.writeRegVec(B, Pr, V); });
   } else {
     // Vector SGPR writes can't target EXEC (EXEC is scalar/pair, never
@@ -702,15 +737,103 @@ void RaiseContext::writeRegExecWidth(ParsedReg Pr, Value *V) {
 }
 
 void RaiseContext::storeVGPR32(int Idx, Value *V) {
+  recordVgprWholeWave(Idx, V); // rocm-systems#159; see writeReg32
   emitUnderExec([&] { Regs.storeVGPR32(B, Idx, V); });
 }
 
 void RaiseContext::storeVGPR64(int Idx, Value *V) {
+  if (!VgprWholeWaveShadow.empty()) {
+    Value *V64 = V;
+    if (V64->getType()->isPointerTy())
+      V64 = B.CreatePtrToInt(V64, I64Ty);
+    if (V64->getType() != I64Ty)
+      V64 = B.CreateBitCast(V64, I64Ty);
+    recordVgprWholeWave(Idx, B.CreateTrunc(V64, I32Ty, "ww_pair_lo"));
+    recordVgprWholeWave(Idx + 1,
+                        B.CreateTrunc(B.CreateLShr(V64, 32), I32Ty, "ww_pair_hi"));
+  }
   emitUnderExec([&] { Regs.storeVGPR64(B, Idx, V); });
 }
 
 void RaiseContext::storeAGPR32(int Idx, Value *V) {
   emitUnderExec([&] { Regs.storeAGPR32(B, Idx, V); });
+}
+
+// ==== rocm-systems#159: whole-wave VGPR shadow (read-side, Path A) =========
+// See the field/method docs in raise-context.h for the correctness argument.
+
+void RaiseContext::initVgprWholeWaveShadow(unsigned NumVgpr) {
+  // Only allocate under a cross-widening projection whose target hardware
+  // packs multiple source waves per target wave (WaveNative). On any
+  // other projection EXEC is full at every source instruction, so the
+  // ordinary EXEC-gated read already observes the whole-wave value and the
+  // shadow would be pure overhead. Leaving the banks empty makes
+  // recordVgprWholeWave / readRegWholeWave transparent no-ops.
+  if (Projection.numSourceWavesPerTarget() <= 1)
+    return;
+  VgprWholeWaveShadow.assign(NumVgpr, nullptr);
+  VgprWholeWaveValidShadow.assign(NumVgpr, nullptr);
+  for (unsigned I = 0; I < NumVgpr; ++I) {
+    VgprWholeWaveShadow[I] =
+        B.CreateAlloca(I32Ty, nullptr, "VgprWW" + llvm::Twine(I));
+    B.CreateStore(ConstantInt::get(I32Ty, 0), VgprWholeWaveShadow[I]);
+    VgprWholeWaveValidShadow[I] =
+        B.CreateAlloca(I1Ty, nullptr, "VgprWWValid" + llvm::Twine(I));
+    B.CreateStore(ConstantInt::getFalse(I1Ty), VgprWholeWaveValidShadow[I]);
+  }
+}
+
+void RaiseContext::recordVgprWholeWave(int Idx, Value *V) {
+  if (Idx < 0 || static_cast<size_t>(Idx) >= VgprWholeWaveShadow.size() ||
+      !VgprWholeWaveShadow[Idx])
+    return;
+  // Coerce to the i32 storage type, mirroring AllocaRegFile::storeVGPR32.
+  Value *Vi = V;
+  if (Vi->getType() != I32Ty) {
+    if (Vi->getType()->isPointerTy())
+      Vi = B.CreatePtrToInt(Vi, I64Ty);
+    if (Vi->getType() == F32Ty)
+      Vi = B.CreateBitCast(Vi, I32Ty);
+    else if (Vi->getType() != I32Ty)
+      Vi = B.CreateTrunc(Vi, I32Ty);
+  }
+  B.CreateStore(Vi, VgprWholeWaveShadow[Idx]);
+  B.CreateStore(ConstantInt::getTrue(I1Ty), VgprWholeWaveValidShadow[Idx]);
+}
+
+Value *RaiseContext::readRegWholeWave(ParsedReg Pr) {
+  // Ordinary (EXEC-gated) reg-file read is always the fallback.
+  Value *Gated = Regs.readReg32(B, Pr);
+  if (Pr.RegKind != ParsedReg::VGPR || Pr.BaseIdx < 0 ||
+      static_cast<size_t>(Pr.BaseIdx) >= VgprWholeWaveShadow.size() ||
+      !VgprWholeWaveShadow[Pr.BaseIdx])
+    return Gated;
+  // The shadow holds the straight-line whole-wave value stored
+  // unconditionally by the producing def's writeReg*; it is present on
+  // every hardware lane (active and inactive). When a dominating store
+  // recorded it in this BB (valid == true) return it, so a convergent
+  // cross-lane read on a source-inactive partner lane observes the
+  // correct value instead of a stale EXEC-gated one. Otherwise (no
+  // in-BB producer, or the value was invalidated at a BB boundary) fall
+  // back to the ordinary read -- never regressing a site the shadow does
+  // not cover.
+  Value *Valid = B.CreateLoad(I1Ty, VgprWholeWaveValidShadow[Pr.BaseIdx],
+                              "vgpr_ww_valid");
+  Value *Shadow =
+      B.CreateLoad(I32Ty, VgprWholeWaveShadow[Pr.BaseIdx], "vgpr_ww");
+  return B.CreateSelect(Valid, Shadow, Gated, "vgpr_ww_sel");
+}
+
+void RaiseContext::clearVgprWholeWaveShadow() {
+  // Whole-wave shadow values only dominate within the BB they were
+  // recorded in (like the M0 and SGPR-wave-mask shadows). At a BB
+  // boundary, mark every entry invalid so readRegWholeWave falls back to
+  // the ordinary EXEC-gated read rather than a value out of dominance
+  // scope. A future reaching-definitions pass could upgrade this to a
+  // per-BB merge (see sgpr-wave-mask-translation.md sec. 7).
+  for (auto *Valid : VgprWholeWaveValidShadow)
+    if (Valid)
+      B.CreateStore(ConstantInt::getFalse(I1Ty), Valid);
 }
 
 void RaiseContext::emitUnderExec(llvm::function_ref<void()> Body) {

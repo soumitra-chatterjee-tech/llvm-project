@@ -1806,6 +1806,12 @@ raiseToIRImpl(llvm::ArrayRef<uint8_t> TextBytes, llvm::StringRef SourceIsa,
     Ctx.SourceWaveSgprPairValidShadow.push_back(PairValidA);
   }
 
+  // rocm-systems#159: whole-wave VGPR shadow for convergent cross-lane reads
+  // (read-side fix). One i32 value + one i1 valid bit per VGPR index. No-op
+  // (empty banks) unless the projection packs multiple source waves per
+  // target wave. Allocated in the entry block so PromoteMemToReg lifts it.
+  Ctx.initVgprWholeWaveShadow(Regs.Vgpr.size());
+
   llvm::Error RaiseReadFailure = llvm::Error::success();
   auto ReadFailureHandler = [&](llvm::Error Err) {
     if (RaiseReadFailure) {
@@ -1942,6 +1948,11 @@ raiseToIRImpl(llvm::ArrayRef<uint8_t> TextBytes, llvm::StringRef SourceIsa,
       Ctx.clearSgprWaveMaskShadow();
       // M0's raise-time constant shadow only dominates within its BB.
       Ctx.clearM0Const();
+      // rocm-systems#159: the whole-wave VGPR shadow values only dominate
+      // within the BB they were recorded in. Invalidate at the boundary so
+      // a convergent cross-lane reader falls back to the ordinary EXEC-gated
+      // read rather than a value out of dominance scope.
+      Ctx.clearVgprWholeWaveShadow();
     }
 
     if (Error E = Ctx.computeVGPRAdjust(Di))
@@ -2158,6 +2169,7 @@ raiseToIRImpl(llvm::ArrayRef<uint8_t> TextBytes, llvm::StringRef SourceIsa,
     SmallVector<AllocaInst *, 512> Allocas;
     Regs.collectAllocas(Allocas);
     Ctx.collectSgprWaveMaskShadowAllocas(Allocas);
+    Ctx.collectVgprWholeWaveShadowAllocas(Allocas); // rocm-systems#159
     PromoteMemToReg(Allocas, DT, &AC);
   }
 
