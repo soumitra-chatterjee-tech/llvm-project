@@ -68,6 +68,21 @@ Value *WaveProjection::emitLaneIdx(IRBuilder<> &B) const {
         Intrinsic::getOrInsertDeclaration(M, Intrinsic::amdgcn_mbcnt_hi);
     LaneId = EB.CreateCall(MbcntHi, {AllOnes, LaneId}, "lane_id");
   }
+  // Under a scaled dispatch a replica lane W_s+i models the same source
+  // thread as lane i, so it must observe the source-wave-local lane id
+  // `raw mod W_s`. Fold here so every consumer of the lane id (cross-lane
+  // addressing and the source's own masked-buffer-access predicate) computes
+  // identically on a lane and its replica. See `SourceWaveScopedLaneIdx`.
+  // The fold is a value dependence dominating the function, not a foldable
+  // predicate, so it survives optimisation by construction.
+  if (SourceWaveScopedLaneIdx) {
+    assert(isPowerOf2_32(Src.WaveSize) &&
+           "source-wave-local lane fold uses `& (W_s - 1)` as `mod W_s`, "
+           "which is only equivalent for a power-of-two source wave size");
+    LaneId = EB.CreateAnd(
+        LaneId, ConstantInt::get(LaneId->getType(), Src.WaveSize - 1u),
+        "scaled_src_lane");
+  }
   CachedLaneIdx = LaneId;
   return LaneId;
 }

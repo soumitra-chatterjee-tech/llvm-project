@@ -362,6 +362,26 @@ protected:
   bool ProvidesFullWaveExecInvariant = false;
   bool SourceWaveScopedLaneOps = false;
   bool PreservesMbcntDerivedExec = false;
+  // Fold the mbcnt-derived lane id to the source-wave-local index
+  // (`raw_hw_lane mod W_s`) in `emitLaneIdx`. Set only by the scaled
+  // projection, where hardware lane `W_s + i` is an exact REPLICA of lane
+  // `i` and models the same source thread, so it must observe the SAME lane
+  // id as its original. That lane id feeds every cross-lane addressing site
+  // (ds_bpermute selectors, LDS/flat per-lane offsets, mbcnt-based source
+  // addressing) and the source's own masked-buffer-access predicate; without
+  // the fold a replica computes a raw-lane-derived address/predicate that
+  // diverges from its original's, and where the source masks a lane with the
+  // OOB sentinel (`select(lane_pred, real_offset, 0x80000000)`) the replica
+  // can read active, select the real offset, and feed an in-bounds-magnitude
+  // garbage offset into a buffer_load that escapes the num-records clamp and
+  // faults (rocm-systems#159/#160). This is the lane-id analogue of the
+  // scaled projection's `emitWorkitemIdX` logical-x remap and the
+  // source-wave rebase in `rebaseSourceWaveLaneSelector` (rocm-systems#195):
+  // a faithful model of a replica being its original (a lane-id VALUE
+  // change), not an optimisation-blocking guard. Default false keeps every
+  // other projection on the raw target hardware lane (WaveNative's upper
+  // half is a distinct source wave, so it must stay raw).
+  bool SourceWaveScopedLaneIdx = false;
 
   // Source max_flat_workgroup_size; 0 until the raiser sets it.
   unsigned MaxFlatWG = 0;
@@ -465,6 +485,10 @@ public:
                                     llvm::Type *I64Ty)
       : ModuloReplicationProjection(SrcIsa, TgtIsa, I32Ty, I64Ty) {
     ScaledDispatchFactor = TgtIsa.WaveSize / SrcIsa.WaveSize;
+    // A replica lane W_s+i models the same source thread as lane i, so it
+    // must observe the source-wave-local lane id (raw mod W_s). See
+    // `SourceWaveScopedLaneIdx`.
+    SourceWaveScopedLaneIdx = true;
   }
 
   // Remap hardware workitem-id.x to the logical source id so replica lanes
