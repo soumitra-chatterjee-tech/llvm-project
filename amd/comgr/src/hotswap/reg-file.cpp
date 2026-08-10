@@ -112,14 +112,42 @@ void AllocaRegFile::init(IRBuilder<> &B, Type *I32Ty, Type *I1Ty,
   // class (see `KVGPRCap` docs in reg-file.h). AGPR storage mirrors
   // the VGPR size because AGPRs share the same index space under MFMA
   // encoding conventions.
+  //
+  // Zero-initialise every VGPR/AGPR alloca with a dominating entry store,
+  // for the same reason the condition scalars (VCC/SCC/EXEC_HI/...) below
+  // are zero/`-1`-initialised: without a dominating store, mem2reg lifts a
+  // read-before-write (or a write reached only through a non-dominating
+  // `emitUnderExec` diamond) to `undef`/poison. That poison is NOT a
+  // faithful model of the source hardware, where an EXEC-masked lane's VGPR
+  // simply RETAINS its prior defined bits and a never-written register is
+  // architecturally-undefined-but-still-a-concrete-value, never poison. The
+  // unfaithfulness is load-bearing: under a valid optimisation (if-
+  // conversion of the per-lane EXEC diamond, then value propagation) the
+  // optimiser is free to materialise a poison skip-arm as any convenient
+  // in-bounds-magnitude value. On the gemma `_fwd_kernel` masked buffer-
+  // access idiom (`select(v_cmp, real_offset, 0x80000000_sentinel)`), a
+  // poison compare-operand can make the source predicate read true and feed
+  // a poison-derived in-bounds-magnitude offset into a `buffer_load`, which
+  // then escapes the `>= NUM_RECORDS` sentinel clamp and faults on gfx950
+  // (rocm-systems#159/#160). Giving the skip-arm a concrete 0 removes the
+  // poison at the source (model fix, not an optimisation-blocking guard):
+  // mem2reg still threads the PRIOR value on every subsequent masked write
+  // (true hardware retain-semantics), and 0 appears only for a genuine
+  // read-before-write, where it is a safe in-bounds address floor. Cost is
+  // negligible: mem2reg + DCE drop the store for every register that is
+  // written before its first read (the overwhelming majority).
   Vgpr.assign(KVGPRCap, nullptr);
-  for (unsigned I = 0; I < KVGPRCap; ++I)
+  Value *VgprZero = ConstantInt::get(I32Ty, 0);
+  for (unsigned I = 0; I < KVGPRCap; ++I) {
     Vgpr[I] = B.CreateAlloca(I32Ty, nullptr, "Vgpr" + std::to_string(I));
-
+    B.CreateStore(VgprZero, Vgpr[I]);
+  }
   if (Isa.HasAgpr) {
     Agpr.assign(KVGPRCap, nullptr);
-    for (unsigned I = 0; I < KVGPRCap; ++I)
+    for (unsigned I = 0; I < KVGPRCap; ++I) {
       Agpr[I] = B.CreateAlloca(I32Ty, nullptr, "Agpr" + std::to_string(I));
+      B.CreateStore(VgprZero, Agpr[I]);
+    }
   }
 
   // Condition-carrying scalar registers are initialised to zero so that a
